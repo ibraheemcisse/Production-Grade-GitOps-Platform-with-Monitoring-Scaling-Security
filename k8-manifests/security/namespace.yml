@@ -1,0 +1,875 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: security
+  labels:
+    name: security
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+
+---
+# OPA Gatekeeper for Policy Enforcement
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: gatekeeper
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: gatekeeper
+    repoURL: https://open-policy-agent.github.io/gatekeeper/charts
+    targetRevision: 3.14.0
+    helm:
+      releaseName: gatekeeper
+      values: |
+        replicas: 2
+        
+        resources:
+          limits:
+            cpu: 1000m
+            memory: 512Mi
+          requests:
+            cpu: 100m
+            memory: 256Mi
+        
+        nodeSelector: {}
+        tolerations: []
+        affinity: {}
+        
+        image:
+          repository: openpolicyagent/gatekeeper
+          crdRepository: openpolicyagent/gatekeeper-crds
+          release: v3.14.0
+          pullPolicy: IfNotPresent
+        
+        audit:
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+        
+        controllerManager:
+          resources:
+            limits:
+              cpu: 1000m
+              memory: 512Mi
+            requests:
+              cpu: 100m
+              memory: 256Mi
+        
+        # Enable mutation (beta feature)
+        enableMutation: true
+        
+        # Exempt namespaces from gatekeeper
+        exemptNamespaces:
+          - kube-system
+          - gatekeeper-system
+          - argocd
+          - monitoring
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: gatekeeper-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Constraint Templates and Constraints
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredlabels
+  namespace: gatekeeper-system
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredLabels
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredlabels
+        
+        violation[{"msg": msg}] {
+          required := input.parameters.labels
+          provided := input.review.object.metadata.labels
+          missing := required[_]
+          not provided[missing]
+          msg := sprintf("Missing required label: %v", [missing])
+        }
+
+---
+apiVersion: config.gatekeeper.sh/v1alpha1
+kind: K8sRequiredLabels
+metadata:
+  name: must-have-app-labels
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+      - apiGroups: [""]
+        kinds: ["Service", "ConfigMap", "Secret"]
+  parameters:
+    labels: ["app.kubernetes.io/name", "app.kubernetes.io/part-of", "app.kubernetes.io/version"]
+
+---
+# Security Context Constraint Template
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequiredsecuritycontext
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequiredSecurityContext
+      validation:
+        openAPIV3Schema:
+          type: object
+          properties:
+            runAsNonRoot:
+              type: boolean
+            readOnlyRootFilesystem:
+              type: boolean
+            allowPrivilegeEscalation:
+              type: boolean
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequiredsecuritycontext
+        
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.template.spec.containers[_]
+          input.parameters.runAsNonRoot == true
+          not container.securityContext.runAsNonRoot == true
+          msg := "Container must run as non-root user"
+        }
+        
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.template.spec.containers[_]
+          input.parameters.readOnlyRootFilesystem == true
+          not container.securityContext.readOnlyRootFilesystem == true
+          msg := "Container must have read-only root filesystem"
+        }
+        
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.template.spec.containers[_]
+          input.parameters.allowPrivilegeEscalation == false
+          not container.securityContext.allowPrivilegeEscalation == false
+          msg := "Container must not allow privilege escalation"
+        }
+
+---
+apiVersion: config.gatekeeper.sh/v1alpha1
+kind: K8sRequiredSecurityContext
+metadata:
+  name: security-context-required
+spec:
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    excludedNamespaces: ["kube-system", "gatekeeper-system", "argocd", "monitoring"]
+  parameters:
+    runAsNonRoot: true
+    readOnlyRootFilesystem: true
+    allowPrivilegeEscalation: false
+
+---
+# Network Policy Template
+apiVersion: templates.gatekeeper.sh/v1beta1
+kind: ConstraintTemplate
+metadata:
+  name: k8srequirenetworkpolicy
+spec:
+  crd:
+    spec:
+      names:
+        kind: K8sRequireNetworkPolicy
+      validation:
+        openAPIV3Schema:
+          type: object
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package k8srequirenetworkpolicy
+        
+        violation[{"msg": msg}] {
+          input.review.kind.kind == "Namespace"
+          input.review.operation == "CREATE"
+          not data.inventory.cluster["networking.k8s.io/v1"].NetworkPolicy[_].metadata.namespace == input.review.object.metadata.name
+          msg := "Namespace must have a NetworkPolicy"
+        }
+
+---
+# Falco for Runtime Security Monitoring
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: falco
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: falco
+    repoURL: https://falcosecurity.github.io/charts
+    targetRevision: 3.8.4
+    helm:
+      releaseName: falco
+      values: |
+        image:
+          repository: falcosecurity/falco-no-driver
+          tag: 0.36.2
+        
+        driver:
+          enabled: true
+          kind: ebpf
+        
+        collectors:
+          enabled: true
+          
+        resources:
+          requests:
+            cpu: 100m
+            memory: 512Mi
+          limits:
+            cpu: 200m
+            memory: 1Gi
+        
+        falco:
+          rules_file:
+            - /etc/falco/falco_rules.yaml
+            - /etc/falco/falco_rules.local.yaml
+            - /etc/falco/k8s_audit_rules.yaml
+            - /etc/falco/rules.d
+          
+          # Custom rules
+          rules:
+            - rule: Detect Suspicious Network Activity
+              desc: Detect network activity to suspicious hosts
+              condition: >
+                spawned_process and proc.name in (curl, wget, nc) and
+                (fd.sip in (suspicious_network_cidrs) or fd.dip in (suspicious_network_cidrs))
+              output: >
+                Suspicious network activity detected (user=%user.name command=%proc.cmdline
+                connection=%fd.name)
+              priority: WARNING
+              tags: [network, suspicious]
+            
+            - rule: Detect Crypto Mining
+              desc: Detect cryptocurrency mining activity
+              condition: >
+                spawned_process and (proc.name in (xmrig, ccminer, cgminer, bfgminer) or
+                proc.cmdline contains "stratum+tcp" or proc.cmdline contains "cryptonight")
+              output: >
+                Cryptocurrency mining activity detected (user=%user.name command=%proc.cmdline)
+              priority: CRITICAL
+              tags: [crypto, mining]
+        
+        falcosidekick:
+          enabled: true
+          replicaCount: 1
+          
+          config:
+            slack:
+              webhookurl: ""  # Set via secret
+              channel: "#security-alerts"
+              username: "falco"
+              icon: ":falco:"
+              title: "Falco Security Alert"
+              minimumpriority: "warning"
+            
+            webhook:
+              address: ""  # Set if using custom webhook
+            
+            customfields: |
+              cluster: gitops-platform-dev
+              environment: development
+          
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: security
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Trivy Operator for Vulnerability Scanning
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: trivy-operator
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: trivy-operator
+    repoURL: https://aquasecurity.github.io/helm-charts
+    targetRevision: 0.16.4
+    helm:
+      releaseName: trivy-operator
+      values: |
+        serviceMonitor:
+          enabled: true
+        
+        trivyOperator:
+          scanJobTimeout: 5m
+          scanJobPodTemplateContainerSecurityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+        
+        operator:
+          replicas: 1
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi
+        
+        # Vulnerability scanner configuration
+        vulnerabilityReports:
+          scanner: Trivy
+          scanJobsInSameNamespace: true
+        
+        # Configuration scanner
+        configAuditReports:
+          scanner: Trivy
+        
+        # Exposed secret scanner
+        exposedSecretReports:
+          scanner: Trivy
+        
+        # RBAC assessment
+        rbacAssessmentReports:
+          scanner: Trivy
+        
+        # Infrastructure assessment
+        infraAssessmentReports:
+          scanner: Trivy
+        
+        # Cluster compliance reports
+        clusterComplianceReports:
+          scanner: Trivy
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: security
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Network Policies for Micro-segmentation
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-all
+  namespace: gitops-platform
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-frontend-to-backend
+  namespace: gitops-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: backend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: frontend
+    ports:
+    - protocol: TCP
+      port: 8080
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-backend-to-database
+  namespace: gitops-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: database
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/component: backend
+    ports:
+    - protocol: TCP
+      port: 5432
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-ingress-to-frontend
+  namespace: gitops-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: frontend
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring-scraping
+  namespace: gitops-platform
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/part-of: gitops-platform
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+    ports:
+    - protocol: TCP
+      port: 8080  # metrics port
+
+---
+# Pod Security Standards via Pod Security Policy
+apiVersion: policy/v1beta1
+kind: PodSecurityPolicy
+metadata:
+  name: restricted-psp
+  annotations:
+    seccomp.security.alpha.kubernetes.io/allowedProfileNames: 'runtime/default'
+    seccomp.security.alpha.kubernetes.io/defaultProfileName: 'runtime/default'
+    apparmor.security.beta.kubernetes.io/allowedProfileNames: 'runtime/default'
+    apparmor.security.beta.kubernetes.io/defaultProfileName: 'runtime/default'
+spec:
+  privileged: false
+  allowPrivilegeEscalation: false
+  requiredDropCapabilities:
+    - ALL
+  volumes:
+    - 'configMap'
+    - 'emptyDir'
+    - 'projected'
+    - 'secret'
+    - 'downwardAPI'
+    - 'persistentVolumeClaim'
+  runAsUser:
+    rule: 'MustRunAsNonRoot'
+  seLinux:
+    rule: 'RunAsAny'
+  fsGroup:
+    rule: 'RunAsAny'
+  readOnlyRootFilesystem: true
+
+---
+# ServiceAccount and RBAC for PSP
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: restricted-psp-user
+  namespace: gitops-platform
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: restricted-psp-user
+  namespace: gitops-platform
+rules:
+- apiGroups: ['policy']
+  resources: ['podsecuritypolicies']
+  resourceNames: ['restricted-psp']
+  verbs: ['use']
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: restricted-psp-user
+  namespace: gitops-platform
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: restricted-psp-user
+subjects:
+- kind: ServiceAccount
+  name: restricted-psp-user
+  namespace: gitops-platform
+
+---
+# Certificate Management with cert-manager
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: cert-manager
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: cert-manager
+    repoURL: https://charts.jetstack.io
+    targetRevision: v1.13.2
+    helm:
+      releaseName: cert-manager
+      values: |
+        installCRDs: true
+        
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        
+        webhook:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+        
+        cainjector:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+        
+        prometheus:
+          enabled: true
+          servicemonitor:
+            enabled: true
+        
+        securityContext:
+          runAsNonRoot: true
+          seccompProfile:
+            type: RuntimeDefault
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: cert-manager
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# ClusterIssuer for Let's Encrypt
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    email: admin@gitops-platform.example.com
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    email: admin@gitops-platform.example.com
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: letsencrypt-staging
+    solvers:
+    - http01:
+        ingress:
+          class: nginx
+
+---
+# External Secrets Operator for Secret Management
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-secrets
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: external-secrets
+    repoURL: https://charts.external-secrets.io
+    targetRevision: 0.9.11
+    helm:
+      releaseName: external-secrets
+      values: |
+        installCRDs: true
+        
+        resources:
+          requests:
+            cpu: 10m
+            memory: 32Mi
+          limits:
+            cpu: 100m
+            memory: 128Mi
+        
+        webhook:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+        
+        certController:
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 128Mi
+        
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1000
+          seccompProfile:
+            type: RuntimeDefault
+        
+        serviceMonitor:
+          enabled: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: external-secrets-system
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# AWS Secrets Manager SecretStore
+apiVersion: external-secrets.io/v1beta1
+kind: SecretStore
+metadata:
+  name: aws-secrets-manager
+  namespace: gitops-platform
+spec:
+  provider:
+    aws:
+      service: SecretsManager
+      region: us-west-2
+      auth:
+        secretRef:
+          accessKeyID:
+            name: aws-credentials
+            key: access-key-id
+          secretAccessKey:
+            name: aws-credentials
+            key: secret-access-key
+
+---
+# External Secret for Database Credentials
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: database-credentials
+  namespace: gitops-platform
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    kind: SecretStore
+    name: aws-secrets-manager
+  target:
+    name: database-secret
+    creationPolicy: Owner
+  data:
+  - secretKey: username
+    remoteRef:
+      key: gitops-platform/database
+      property: username
+  - secretKey: password
+    remoteRef:
+      key: gitops-platform/database
+      property: password
+
+---
+# Admission Controller for Image Vulnerability Scanning
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionWebhook
+metadata:
+  name: trivy-vulnerability-scanner
+spec:
+  clientConfig:
+    service:
+      name: trivy-admission-webhook
+      namespace: security
+      path: /validate
+  rules:
+  - operations: ["CREATE", "UPDATE"]
+    apiGroups: ["apps"]
+    apiVersions: ["v1"]
+    resources: ["deployments", "statefulsets", "daemonsets"]
+  - operations: ["CREATE", "UPDATE"]
+    apiGroups: [""]
+    apiVersions: ["v1"]
+    resources: ["pods"]
+  admissionReviewVersions: ["v1", "v1beta1"]
+  sideEffects: None
+  failurePolicy: Fail
+
+---
+# Security Monitoring Dashboard ConfigMap
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: security-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  security-dashboard.json: |
+    {
+      "dashboard": {
+        "id": null,
+        "title": "GitOps Platform Security Dashboard",
+        "tags": ["security", "gitops"],
+        "style": "dark",
+        "timezone": "browser",
+        "panels": [
+          {
+            "id": 1,
+            "title": "Vulnerability Scan Results",
+            "type": "stat",
+            "targets": [
+              {
+                "expr": "sum(rate(trivy_vulnerability_total[5m])) by (severity)",
+                "legendFormat": "{{severity}}"
+              }
+            ],
+            "fieldConfig": {
+              "defaults": {
+                "color": {
+                  "mode": "thresholds"
+                },
+                "thresholds": {
+                  "steps": [
+                    {"color": "green", "value": null},
+                    {"color": "yellow", "value": 1},
+                    {"color": "red", "value": 10}
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "id": 2,
+            "title": "Falco Security Alerts",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "increase(falco_events_total[1h])",
+                "legendFormat": "{{rule}}"
+              }
+            ]
+          },
+          {
+            "id": 3,
+            "title": "Policy Violations",
+            "type": "graph",
+            "targets": [
+              {
+                "expr": "sum(rate(gatekeeper_violations_total[5m])) by (policy)",
+                "legendFormat": "{{policy}}"
+              }
+            ]
+          },
+          {
+            "id": 4,
+            "title": "Certificate Expiration",
+            "type": "table",
+            "targets": [
+              {
+                "expr": "(cert_manager_certificate_expiration_timestamp_seconds - time()) / 86400",
+                "legendFormat": "{{name}} ({{namespace}})"
+              }
+            ]
+          }
+        ],
+        "time": {
+          "from": "now-6h",
+          "to": "now"
+        },
+        "refresh": "30s"
+      }
+    }

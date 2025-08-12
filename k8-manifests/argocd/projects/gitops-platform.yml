@@ -1,0 +1,91 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: gitops-platform
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: gitops-platform-project
+spec:
+  description: GitOps Platform Project
+  
+  # Source repositories
+  sourceRepos:
+    - 'https://github.com/your-org/gitops-platform-config.git'
+    - 'https://prometheus-community.github.io/helm-charts'
+    - 'https://grafana.github.io/helm-charts'
+    - 'https://jaegertracing.github.io/helm-charts'
+  
+  # Destination clusters and namespaces
+  destinations:
+    - namespace: 'gitops-platform'
+      server: https://kubernetes.default.svc
+    - namespace: 'monitoring'
+      server: https://kubernetes.default.svc
+    - namespace: 'logging'
+      server: https://kubernetes.default.svc
+    - namespace: 'security'
+      server: https://kubernetes.default.svc
+    - namespace: 'kube-system'
+      server: https://kubernetes.default.svc
+  
+  # Cluster resource whitelist
+  clusterResourceWhitelist:
+    - group: ''
+      kind: Namespace
+    - group: 'apiextensions.k8s.io'
+      kind: CustomResourceDefinition
+    - group: 'rbac.authorization.k8s.io'
+      kind: ClusterRole
+    - group: 'rbac.authorization.k8s.io'
+      kind: ClusterRoleBinding
+    - group: 'admissionregistration.k8s.io'
+      kind: MutatingWebhookConfiguration
+    - group: 'admissionregistration.k8s.io'
+      kind: ValidatingWebhookConfiguration
+  
+  # Namespace resource whitelist
+  namespaceResourceWhitelist:
+    - group: ''
+      kind: ConfigMap
+    - group: ''
+      kind: Secret
+    - group: ''
+      kind: Service
+    - group: ''
+      kind: ServiceAccount
+    - group: 'apps'
+      kind: Deployment
+    - group: 'apps'
+      kind: StatefulSet
+    - group: 'apps'
+      kind: DaemonSet
+    - group: 'networking.k8s.io'
+      kind: Ingress
+    - group: 'networking.k8s.io'
+      kind: NetworkPolicy
+    - group: 'policy'
+      kind: PodDisruptionBudget
+    - group: 'autoscaling'
+      kind: HorizontalPodAutoscaler
+    - group: 'monitoring.coreos.com'
+      kind: ServiceMonitor
+    - group: 'monitoring.coreos.com'
+      kind: PrometheusRule
+  
+  # RBAC roles
+  roles:
+    - name: developer
+      description: Developer role for GitOps Platform
+      policies:
+        - p, proj:gitops-platform:developer, applications, get, gitops-platform/*, allow
+        - p, proj:gitops-platform:developer, applications, sync, gitops-platform/*, allow
+      groups:
+        - gitops-platform:developers
+    
+    - name: admin
+      description: Admin role for GitOps Platform
+      policies:
+        - p, proj:gitops-platform:admin, applications, *, gitops-platform/*, allow
+        - p, proj:gitops-platform:admin, repositories, *, *, allow
+      groups:
+        - gitops-platform:admins

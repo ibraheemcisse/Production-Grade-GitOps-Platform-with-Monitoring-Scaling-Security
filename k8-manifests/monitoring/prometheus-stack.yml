@@ -1,0 +1,662 @@
+# k8s-manifests/monitoring/prometheus-stack.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    name: monitoring
+
+---
+# Prometheus Operator via Helm
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: prometheus-stack
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: kube-prometheus-stack
+    repoURL: https://prometheus-community.github.io/helm-charts
+    targetRevision: 51.2.0
+    helm:
+      releaseName: prometheus-stack
+      values: |
+        global:
+          imageRegistry: ""
+          imagePullSecrets: []
+        
+        # Prometheus configuration
+        prometheus:
+          prometheusSpec:
+            replicas: 2
+            retention: 30d
+            retentionSize: 50GB
+            storageSpec:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp2
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 50Gi
+            
+            # Resource limits
+            resources:
+              requests:
+                memory: 2Gi
+                cpu: 1
+              limits:
+                memory: 4Gi
+                cpu: 2
+            
+            # ServiceMonitor selector
+            serviceMonitorSelectorNilUsesHelmValues: false
+            serviceMonitorSelector: {}
+            serviceMonitorNamespaceSelector: {}
+            
+            # Rule selector
+            ruleSelectorNilUsesHelmValues: false
+            ruleSelector: {}
+            ruleNamespaceSelector: {}
+            
+            # Pod Monitor selector
+            podMonitorSelectorNilUsesHelmValues: false
+            podMonitorSelector: {}
+            podMonitorNamespaceSelector: {}
+            
+            # External labels
+            externalLabels:
+              cluster: gitops-platform-dev
+              environment: development
+            
+            # Additional scrape configs
+            additionalScrapeConfigs:
+              - job_name: 'kubernetes-pods'
+                kubernetes_sd_configs:
+                  - role: pod
+                relabel_configs:
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+                    action: keep
+                    regex: true
+                  - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+                    action: replace
+                    target_label: __metrics_path__
+                    regex: (.+)
+                  - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+                    action: replace
+                    regex: ([^:]+)(?::\d+)?;(\d+)
+                    replacement: $1:$2
+                    target_label: __address__
+        
+        # Grafana configuration
+        grafana:
+          enabled: true
+          replicas: 1
+          
+          # Admin credentials
+          adminPassword: admin123!
+          
+          # Persistence
+          persistence:
+            enabled: true
+            storageClassName: gp2
+            size: 10Gi
+          
+          # Ingress
+          ingress:
+            enabled: true
+            ingressClassName: nginx
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"
+            hosts:
+              - grafana.gitops-platform.example.com
+            tls:
+              - secretName: grafana-tls
+                hosts:
+                  - grafana.gitops-platform.example.com
+          
+          # Grafana configuration
+          grafana.ini:
+            server:
+              root_url: https://grafana.gitops-platform.example.com
+            security:
+              disable_gravatar: true
+            auth:
+              disable_login_form: false
+            auth.anonymous:
+              enabled: false
+            analytics:
+              check_for_updates: false
+              reporting_enabled: false
+          
+          # Datasources
+          datasources:
+            datasources.yaml:
+              apiVersion: 1
+              datasources:
+                - name: Prometheus
+                  type: prometheus
+                  url: http://prometheus-stack-kube-prom-prometheus:9090
+                  access: proxy
+                  isDefault: true
+                - name: Loki
+                  type: loki
+                  url: http://loki:3100
+                  access: proxy
+                - name: Jaeger
+                  type: jaeger
+                  url: http://jaeger-query:16686
+                  access: proxy
+          
+          # Dashboard providers
+          dashboardProviders:
+            dashboardproviders.yaml:
+              apiVersion: 1
+              providers:
+                - name: 'default'
+                  orgId: 1
+                  folder: ''
+                  type: file
+                  disableDeletion: false
+                  editable: true
+                  options:
+                    path: /var/lib/grafana/dashboards/default
+                - name: 'gitops-platform'
+                  orgId: 1
+                  folder: 'GitOps Platform'
+                  type: file
+                  disableDeletion: false
+                  editable: true
+                  options:
+                    path: /var/lib/grafana/dashboards/gitops-platform
+          
+          # Custom dashboards
+          dashboards:
+            gitops-platform:
+              kubernetes-cluster:
+                gnetId: 7249
+                revision: 1
+                datasource: Prometheus
+              kubernetes-pods:
+                gnetId: 6417
+                revision: 1
+                datasource: Prometheus
+              nginx-ingress:
+                gnetId: 9614
+                revision: 1
+                datasource: Prometheus
+              argocd:
+                gnetId: 14584
+                revision: 1
+                datasource: Prometheus
+        
+        # AlertManager configuration
+        alertmanager:
+          alertmanagerSpec:
+            replicas: 2
+            retention: 120h
+            storage:
+              volumeClaimTemplate:
+                spec:
+                  storageClassName: gp2
+                  accessModes: ["ReadWriteOnce"]
+                  resources:
+                    requests:
+                      storage: 10Gi
+            
+            # AlertManager configuration
+            configSecret: alertmanager-config
+          
+          # Ingress for AlertManager
+          ingress:
+            enabled: true
+            ingressClassName: nginx
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"
+            hosts:
+              - alertmanager.gitops-platform.example.com
+            tls:
+              - secretName: alertmanager-tls
+                hosts:
+                  - alertmanager.gitops-platform.example.com
+        
+        # Node Exporter
+        nodeExporter:
+          enabled: true
+        
+        # Kube State Metrics
+        kubeStateMetrics:
+          enabled: true
+        
+        # Default rules
+        defaultRules:
+          create: true
+          rules:
+            alertmanager: true
+            etcd: true
+            configReloaders: true
+            general: true
+            k8s: true
+            kubeApiserverAvailability: true
+            kubeApiserverBurnrate: true
+            kubeApiserverHistogram: true
+            kubeApiserverSlos: true
+            kubelet: true
+            kubeProxy: true
+            kubePrometheusGeneral: true
+            kubePrometheusNodeRecording: true
+            kubernetesApps: true
+            kubernetesResources: true
+            kubernetesStorage: true
+            kubernetesSystem: true
+            kubeScheduler: true
+            kubeStateMetrics: true
+            network: true
+            node: true
+            nodeExporterAlerting: true
+            nodeExporterRecording: true
+            prometheus: true
+            prometheusOperator: true
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# AlertManager Configuration Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: alertmanager-config
+  namespace: monitoring
+type: Opaque
+stringData:
+  alertmanager.yml: |
+    global:
+      smtp_smarthost: 'localhost:587'
+      smtp_from: 'alerts@gitops-platform.example.com'
+      slack_api_url: 'YOUR_SLACK_WEBHOOK_URL'
+    
+    route:
+      group_by: ['alertname', 'cluster', 'service']
+      group_wait: 10s
+      group_interval: 10s
+      repeat_interval: 1h
+      receiver: 'default-receiver'
+      routes:
+        - match:
+            severity: critical
+          receiver: 'critical-alerts'
+        - match:
+            severity: warning
+          receiver: 'warning-alerts'
+        - match:
+            alertname: DeadMansSwitch
+          receiver: 'null'
+    
+    receivers:
+      - name: 'null'
+      
+      - name: 'default-receiver'
+        slack_configs:
+          - channel: '#alerts'
+            title: 'GitOps Platform Alert'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+            send_resolved: true
+      
+      - name: 'critical-alerts'
+        slack_configs:
+          - channel: '#critical-alerts'
+            title: '🚨 CRITICAL: GitOps Platform Alert'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+            send_resolved: true
+        email_configs:
+          - to: 'oncall@gitops-platform.example.com'
+            subject: '[CRITICAL] GitOps Platform Alert'
+            body: |
+              {{ range .Alerts }}
+              Alert: {{ .Annotations.summary }}
+              Description: {{ .Annotations.description }}
+              {{ end }}
+      
+      - name: 'warning-alerts'
+        slack_configs:
+          - channel: '#alerts'
+            title: '⚠️ WARNING: GitOps Platform Alert'
+            text: '{{ range .Alerts }}{{ .Annotations.summary }}{{ end }}'
+            send_resolved: true
+
+---
+# Loki for Log Aggregation
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: loki-stack
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: loki-stack
+    repoURL: https://grafana.github.io/helm-charts
+    targetRevision: 2.9.11
+    helm:
+      releaseName: loki
+      values: |
+        loki:
+          enabled: true
+          persistence:
+            enabled: true
+            storageClassName: gp2
+            size: 50Gi
+          
+          config:
+            auth_enabled: false
+            server:
+              http_listen_port: 3100
+            ingester:
+              lifecycler:
+                address: 127.0.0.1
+                ring:
+                  kvstore:
+                    store: inmemory
+                  replication_factor: 1
+              chunk_idle_period: 3m
+              chunk_block_size: 262144
+              chunk_retain_period: 1m
+            schema_config:
+              configs:
+                - from: 2020-10-24
+                  store: boltdb-shipper
+                  object_store: filesystem
+                  schema: v11
+                  index:
+                    prefix: index_
+                    period: 24h
+            storage_config:
+              boltdb_shipper:
+                active_index_directory: /loki/boltdb-shipper-active
+                cache_location: /loki/boltdb-shipper-cache
+                shared_store: filesystem
+              filesystem:
+                directory: /loki/chunks
+            limits_config:
+              enforce_metric_name: false
+              reject_old_samples: true
+              reject_old_samples_max_age: 168h
+        
+        promtail:
+          enabled: true
+          config:
+            server:
+              http_listen_port: 3101
+            positions:
+              filename: /tmp/positions.yaml
+            clients:
+              - url: http://loki:3100/loki/api/v1/push
+            scrape_configs:
+              - job_name: kubernetes-pods
+                kubernetes_sd_configs:
+                  - role: pod
+                pipeline_stages:
+                  - docker: {}
+                relabel_configs:
+                  - source_labels:
+                      - __meta_kubernetes_pod_controller_name
+                    regex: ([0-9a-z-.]+?)(-[0-9a-f]{8,10})?
+                    action: replace
+                    target_label: __tmp_controller_name
+                  - source_labels:
+                      - __meta_kubernetes_pod_label_app_kubernetes_io_name
+                      - __meta_kubernetes_pod_label_app
+                      - __tmp_controller_name
+                      - __meta_kubernetes_pod_name
+                    regex: ^;*([^;]+)(;.*)?$
+                    action: replace
+                    target_label: app
+                  - source_labels:
+                      - __meta_kubernetes_pod_label_app_kubernetes_io_component
+                      - __meta_kubernetes_pod_label_component
+                    regex: ^;*([^;]+)(;.*)?$
+                    action: replace
+                    target_label: component
+        
+        fluent-bit:
+          enabled: false
+        
+        grafana:
+          enabled: false
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Jaeger for Distributed Tracing
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: jaeger
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: jaeger
+    repoURL: https://jaegertracing.github.io/helm-charts
+    targetRevision: 0.71.2
+    helm:
+      releaseName: jaeger
+      values: |
+        provisionDataStore:
+          cassandra: false
+          elasticsearch: true
+        
+        storage:
+          type: elasticsearch
+          elasticsearch:
+            host: elasticsearch-master
+            port: 9200
+            scheme: http
+            user: ""
+            password: ""
+        
+        agent:
+          enabled: true
+        
+        collector:
+          enabled: true
+          service:
+            type: ClusterIP
+          replicaCount: 2
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 200m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+        
+        query:
+          enabled: true
+          replicaCount: 2
+          service:
+            type: ClusterIP
+          ingress:
+            enabled: true
+            ingressClassName: nginx
+            annotations:
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+              cert-manager.io/cluster-issuer: "letsencrypt-prod"
+            hosts:
+              - jaeger.gitops-platform.example.com
+            tls:
+              - secretName: jaeger-tls
+                hosts:
+                  - jaeger.gitops-platform.example.com
+          resources:
+            requests:
+              memory: 256Mi
+              cpu: 200m
+            limits:
+              memory: 512Mi
+              cpu: 500m
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Elasticsearch for Jaeger Storage
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: elasticsearch
+  namespace: argocd
+spec:
+  project: gitops-platform
+  source:
+    chart: elasticsearch
+    repoURL: https://helm.elastic.co
+    targetRevision: 7.17.3
+    helm:
+      releaseName: elasticsearch
+      values: |
+        clusterName: "elasticsearch"
+        nodeGroup: "master"
+        
+        roles:
+          master: "true"
+          ingest: "true"
+          data: "true"
+          remote_cluster_client: "true"
+        
+        replicas: 3
+        minimumMasterNodes: 2
+        
+        esMajorVersion: ""
+        
+        clusterDeprecationIndexing: "false"
+        
+        esConfig:
+          elasticsearch.yml: |
+            cluster.name: "elasticsearch"
+            network.host: 0.0.0.0
+            discovery.seed_hosts: "elasticsearch-master-headless"
+            cluster.initial_master_nodes: "elasticsearch-master-0,elasticsearch-master-1,elasticsearch-master-2"
+        
+        extraEnvs:
+          - name: ELASTIC_PASSWORD
+            valueFrom:
+              secretKeyRef:
+                name: elasticsearch-credentials
+                key: password
+          - name: ELASTIC_USERNAME
+            valueFrom:
+              secretKeyRef:
+                name: elasticsearch-credentials
+                key: username
+        
+        secretMounts: []
+        
+        image: "docker.elastic.co/elasticsearch/elasticsearch"
+        imageTag: "7.17.9"
+        imagePullPolicy: "IfNotPresent"
+        
+        podSecurityPolicy:
+          create: false
+          name: ""
+        
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: "2Gi"
+          limits:
+            cpu: "1000m"
+            memory: "2Gi"
+        
+        initResources: {}
+        
+        networkHost: "0.0.0.0"
+        
+        volumeClaimTemplate:
+          accessModes: ["ReadWriteOnce"]
+          storageClassName: gp2
+          resources:
+            requests:
+              storage: 100Gi
+        
+        rbac:
+          create: true
+          serviceAccountName: ""
+        
+        podSecurityContext:
+          fsGroup: 1000
+          runAsUser: 1000
+        
+        securityContext:
+          capabilities:
+            drop:
+              - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 1000
+        
+        terminationGracePeriod: 120
+        
+        sysctlVmMaxMapCount: 262144
+        
+        readinessProbe:
+          failureThreshold: 3
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          successThreshold: 3
+          timeoutSeconds: 5
+        
+        clusterHealthCheckParams: "wait_for_status=yellow&timeout=1s"
+        
+        antiAffinity: "hard"
+        
+        # Shrink default JVM heap.
+        esJavaOpts: "-Xmx1g -Xms1g"
+        
+        extraInitContainers: []
+        
+        keystore: []
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+
+---
+# Elasticsearch Credentials Secret
+apiVersion: v1
+kind: Secret
+metadata:
+  name: elasticsearch-credentials
+  namespace: monitoring
+type: Opaque
+stringData:
+  username: elastic
+  password: changeme123!

@@ -1,0 +1,52 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: success-rate
+  namespace: gitops-platform
+spec:
+  args:
+  - name: service-name
+    value: frontend-canary
+  - name: prometheus-server
+    value: http://prometheus-server.monitoring.svc:9090
+  
+  metrics:
+  - name: success-rate
+    initialDelay: 60s
+    interval: 60s
+    count: 5
+    successCondition: result[0] >= 0.95
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: "{{args.prometheus-server}}"
+        query: |
+          sum(rate(http_requests_total{job="{{args.service-name}}",code!~"5.."}[5m])) /
+          sum(rate(http_requests_total{job="{{args.service-name}}"}[5m]))
+  
+  - name: latency
+    initialDelay: 60s
+    interval: 60s
+    count: 5
+    successCondition: result[0] <= 0.2
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: "{{args.prometheus-server}}"
+        query: |
+          histogram_quantile(0.95,
+            sum(rate(http_request_duration_seconds_bucket{job="{{args.service-name}}"}[5m])) by (le)
+          )
+  
+  - name: error-rate
+    initialDelay: 60s
+    interval: 60s
+    count: 5
+    successCondition: result[0] <= 0.05
+    failureLimit: 2
+    provider:
+      prometheus:
+        address: "{{args.prometheus-server}}"
+        query: |
+          sum(rate(http_requests_total{job="{{args.service-name}}",code=~"5.."}[5m])) /
+          sum(rate(http_requests_total{job="{{args.service-name}}"}[5m]))
